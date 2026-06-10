@@ -96,7 +96,11 @@ def main() -> int:
         if device is None:
             log.error("device %r not in %s", args.dump_raw, args.config)
             return 1
-        print(panos_api.op_raw(device, panos_api.GP_USERS_CMD))
+        try:
+            print(panos_api.op_raw(device, panos_api.GP_USERS_CMD))
+        except Exception as exc:
+            log.error("%s: %s", device["name"], exc)
+            return 1
         return 0
     if args.once:
         sys.stdout.write(serialize(run_cycle(devices)))

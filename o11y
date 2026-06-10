@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+# Management entrypoint for the Northbound observability stack.
+# Targets: Debian/Ubuntu Docker hosts, macOS (Docker Desktop), WSL2.
+# Compatible with bash 3.2 (macOS default) -- no mapfile, no assoc arrays.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+ENV_FILE="$ROOT/.env"
+VM_LOCAL="http://127.0.0.1:8428"
+GRAFANA_LOCAL="http://127.0.0.1:3000"
+BACKUP_DIR_DEFAULT="$ROOT/backups"
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf 'PASS %s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------- preflight ----------
+
+need_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker not found -- run scripts/install.sh first"
+    if ! docker info >/dev/null 2>&1; then
+        case "$(uname -s)" in
+            Darwin) die "Docker daemon not running -- start Docker Desktop (open -a Docker)" ;;
+            *)      die "Docker daemon not running -- try: sudo systemctl start docker (or re-login if you were just added to the docker group)" ;;
+        esac
+    fi
+    docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin not found -- run scripts/install.sh"
+}
+
+need_curl() {
+    command -v curl >/dev/null 2>&1 || die "curl not found -- install it (apt-get install curl)"
+}
+
+need_env() {
+    [ -f "$ENV_FILE" ] || die ".env not found -- run: ./o11y init"
+}
+
+# Read one value out of .env without sourcing it (no code execution,
+# no dependence on every value being shell-safe). Last assignment wins
+# (matches compose dotenv); strips exactly one layer of quotes.
+env_get() {
+    val=$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1)
+    case "$val" in
+        "'"*"'" | '"'*'"') val=${val#?}; val=${val%?} ;;
+    esac
+    printf '%s\n' "$val"
+}
+
+compose_project() {
+    docker compose config | sed -n 's/^name: *//p'
+}
+
+# ---------- init ----------
+
+# Values are stored single-quoted: compose's dotenv parser treats them as
+# fully literal (no ${} expansion), but they can never contain a single
+# quote -- so we reject those at entry instead of escaping (compose dotenv
+# is not shell; bash-style '\'' splicing breaks it).
+no_squote() {
+    case "$1" in
+        *"'"*) die "$2 must not contain a single quote (unsupported in .env values)" ;;
+    esac
+}
+
+sq() { printf "'%s'" "$1"; }
+
+cmd_init() {
+    if [ -f "$ENV_FILE" ]; then
+        printf '.env already exists. Overwrite? [y/N] '
+        read -r reply
+        case "$reply" in y|Y|yes|YES) ;; *) say "Keeping existing .env."; return 0 ;; esac
+    fi
+
+    printf 'Grafana admin password: '
+    read -rs grafana_pw; printf '\n'
+    [ -n "$grafana_pw" ] || die "Grafana admin password must not be empty"
+    no_squote "$grafana_pw" "Grafana admin password"
+
+    printf 'PAN-OS API key (Enter to skip and fill in later): '
+    read -rs panos_key; printf '\n'
+    no_squote "$panos_key" "PAN-OS API key"
+
+    printf 'TLS verification [true/false/path to CA bundle] (default true): '
+    read -r verify_tls
+    [ -n "$verify_tls" ] || verify_tls=true
+    no_squote "$verify_tls" "TLS verification value"
+
+    printf 'Poll interval seconds (default 60): '
+    read -r interval
+    [ -n "$interval" ] || interval=60
+    case "$interval" in
+        *[!0-9]*) die "poll interval must be a whole number of seconds" ;;
+    esac
+
+    umask 077
+    {
+        printf 'VM_URL=http://victoriametrics:8428\n'
+        printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$(sq "$grafana_pw")"
+        printf 'PANOS_API_KEY=%s\n' "$(sq "$panos_key")"
+        printf 'PANOS_VERIFY_TLS=%s\n' "$(sq "$verify_tls")"
+        printf 'POLL_INTERVAL=%s\n' "$(sq "$interval")"
+        printf '# Per-device key override: PANOS_API_KEY__FW_EAST_01=...\n'
+        printf '# LOG_LEVEL=DEBUG\n'
+    } > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    say ".env written (mode 600)."
+    [ -n "$panos_key" ] || say "NOTE: PANOS_API_KEY is empty -- the connector will report every device down until you set it."
+
+    cmd_check
+}
+
+# ---------- check ----------
+
+cmd_check() {
+    need_docker
+    need_curl
+    need_env
+    rc=0
+
+    perms=$(ls -l "$ENV_FILE" | cut -c1-10)
+    if [ "$perms" = "-rw-------" ]; then
+        ok ".env permissions are 600"
+    else
+        fail ".env permissions are $perms -- run: chmod 600 .env"; rc=1
+    fi
+
+    for var in VM_URL GRAFANA_ADMIN_PASSWORD; do
+        if [ -n "$(env_get "$var")" ]; then
+            ok "$var is set"
+        else
+            fail "$var is empty in .env"; rc=1
+        fi
+    done
+    interval=$(env_get POLL_INTERVAL)
+    case "$interval" in
+        ''|*[!0-9]*) fail "POLL_INTERVAL='$interval' must be a whole number of seconds"; rc=1 ;;
+        *) ok "POLL_INTERVAL=$interval" ;;
+    esac
+    if [ -n "$(env_get PANOS_API_KEY)" ]; then
+        ok "PANOS_API_KEY is set"
+    else
+        say "WARN PANOS_API_KEY is empty (devices will report down)"
+    fi
+
+    verify_tls=$(env_get PANOS_VERIFY_TLS)
+    case "$verify_tls" in
+        true|false|"") ok "PANOS_VERIFY_TLS=$verify_tls" ;;
+        *)  if [ -f "$verify_tls" ]; then
+                say "WARN PANOS_VERIFY_TLS is a CA bundle path: it must also be mounted into the connector at $verify_tls (add a volume in compose.yaml)"
+            else
+                fail "PANOS_VERIFY_TLS=$verify_tls is neither true/false nor an existing file"; rc=1
+            fi ;;
+    esac
+
+    if docker compose config --quiet 2>/dev/null; then
+        ok "compose.yaml is valid"
+    else
+        fail "docker compose config failed:"; docker compose config >/dev/null || true; rc=1
+    fi
+
+    say "checking inventory (builds the connector image on first run)..."
+    if docker compose run --rm --no-deps -T --entrypoint python panos-connector - <<'PY'
+import sys, yaml
+data = yaml.safe_load(open("/config/devices.yaml")) or {}
+devices = data.get("devices") or []
+errors = []
+if not devices:
+    errors.append("no devices defined")
+names = []
+for d in devices:
+    if not isinstance(d, dict):
+        errors.append("malformed device entry: %r" % d)
+        continue
+    for key in ("name", "host", "site", "role"):
+        if not d.get(key):
+            errors.append("device %r missing %r" % (d.get("name") or d, key))
+    names.append(d.get("name"))
+for n in sorted(set(n for n in names if names.count(n) > 1)):
+    errors.append("duplicate device name %r" % n)
+for e in errors:
+    print("  " + e)
+sys.exit(1 if errors else 0)
+PY
+    then
+        ok "inventory/devices.yaml is valid"
+    else
+        fail "inventory/devices.yaml has problems (see above)"; rc=1
+    fi
+
+    [ "$rc" -eq 0 ] && say "All checks passed." || say "Checks FAILED."
+    return "$rc"
+}
+
+# ---------- lifecycle ----------
+
+cmd_up() {
+    cmd_check
+    docker compose up -d --build
+    say ""
+    say "Stack starting. Grafana: $GRAFANA_LOCAL (user admin). Try: ./o11y status"
+}
+
+cmd_down()    { need_docker; docker compose down; }
+cmd_restart() { need_docker; need_env; docker compose restart "$@"; }
+cmd_logs()    { need_docker; docker compose logs -f --tail=100 "$@"; }
+
+cmd_update() {
+    need_docker
+    need_env
+    git pull --ff-only
+    docker compose pull
+    docker compose build
+    cmd_check
+    docker compose up -d
+    say "waiting for services to become healthy..."
+    waited=0
+    until curl -fsS "$VM_LOCAL/health" >/dev/null 2>&1 \
+          && curl -fsS "$GRAFANA_LOCAL/api/health" >/dev/null 2>&1; do
+        sleep 3
+        waited=$((waited + 3))
+        [ "$waited" -lt 120 ] || { fail "services not healthy after ${waited}s -- check ./o11y logs"; return 1; }
+    done
+    say "update complete and healthy."
+}
+
+# ---------- status ----------
+
+cmd_status() {
+    need_docker
+    need_curl
+    need_env
+    docker compose ps
+    say ""
+
+    if out=$(curl -fsS "$VM_LOCAL/health" 2>/dev/null); then
+        ok "VictoriaMetrics /health: $out"
+    else
+        fail "VictoriaMetrics not responding on $VM_LOCAL"
+    fi
+    if curl -fsS "$GRAFANA_LOCAL/api/health" >/dev/null 2>&1; then
+        ok "Grafana /api/health: ok"
+    else
+        fail "Grafana not responding on $GRAFANA_LOCAL"
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        say "WARN python3 not found on host -- skipping freshness/device/alert detail"
+        return 0
+    fi
+
+    lag=$(curl -fsS --get --data-urlencode 'query=time()-max(timestamp(panos_connector_up))' \
+            "$VM_LOCAL/api/v1/query" 2>/dev/null \
+          | python3 -c 'import json,sys
+r=json.load(sys.stdin)["data"]["result"]
+print(int(float(r[0]["value"][1])) if r else "")' 2>/dev/null) || lag=""
+    if [ -n "$lag" ]; then
+        interval=$(env_get POLL_INTERVAL)
+        case "$interval" in ''|*[!0-9]*) interval=60 ;; esac
+        if [ "$lag" -le $((interval * 3)) ]; then
+            ok "last connector push ${lag}s ago"
+        else
+            fail "last connector push ${lag}s ago (interval is ${interval}s) -- connector may be stuck"
+        fi
+    else
+        say "WARN no panos_connector_up data in VictoriaMetrics yet"
+    fi
+
+    curl -fsS --get --data-urlencode 'query=panos_connector_up' "$VM_LOCAL/api/v1/query" 2>/dev/null \
+      | python3 -c 'import json,sys
+for s in sorted(json.load(sys.stdin)["data"]["result"], key=lambda x: x["metric"].get("device","")):
+    state = "up" if s["value"][1] == "1" else "DOWN"
+    print("  device %-20s %s" % (s["metric"].get("device","?"), state))' 2>/dev/null || true
+
+    grafana_pw=$(env_get GRAFANA_ADMIN_PASSWORD)
+    if [ -n "$grafana_pw" ]; then
+        # credential goes to curl via config on stdin, never argv
+        pw_esc=$(printf '%s' "$grafana_pw" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        if rules=$(printf 'user = "admin:%s"\n' "$pw_esc" \
+                     | curl -fsS -K - "$GRAFANA_LOCAL/api/prometheus/grafana/api/v1/rules" 2>/dev/null); then
+            firing=$(printf '%s' "$rules" | python3 -c 'import json,sys
+n=[]
+for g in json.load(sys.stdin)["data"]["groups"]:
+    for r in g["rules"]:
+        for a in r.get("alerts", []):
+            if a.get("state") == "Alerting":
+                n.append(a["labels"].get("device", r.get("name","?")))
+print(",".join(n))' 2>/dev/null) || firing=""
+            if [ -n "$firing" ]; then
+                fail "alerts FIRING for: $firing"
+            else
+                ok "no alerts firing"
+            fi
+        else
+            say "WARN could not query Grafana alert state (is GRAFANA_ADMIN_PASSWORD correct?)"
+        fi
+    fi
+}
+
+# ---------- connector test modes ----------
+
+cmd_test_device() {
+    [ $# -ge 1 ] || die "usage: ./o11y test-device <device-name>"
+    need_docker; need_env
+    docker compose run --rm --no-deps panos-connector --dump-raw "$1"
+}
+
+cmd_poll_once() {
+    need_docker; need_env
+    docker compose run --rm --no-deps panos-connector --once
+}
+
+# ---------- backup / restore ----------
+
+cmd_backup() {
+    need_docker; need_curl; need_env
+    dest="${1:-$BACKUP_DIR_DEFAULT}"
+    mkdir -p "$dest"
+    dest=$(cd "$dest" && pwd)   # docker -v treats relative paths as volume names
+    stamp=$(date +%Y%m%d-%H%M%S)
+
+    curl -fsS "$VM_LOCAL/health" >/dev/null 2>&1 || die "VictoriaMetrics must be running to back up (./o11y up)"
+
+    say "creating VictoriaMetrics snapshot..."
+    snap=$(curl -fsS "$VM_LOCAL/snapshot/create" | sed -n 's/.*"snapshot":"\([^"]*\)".*/\1/p') \
+        || die "snapshot creation failed"
+    [ -n "$snap" ] || die "snapshot creation failed"
+    # -h dereferences: VM snapshots are symlink trees into the storage dir.
+    if ! docker compose exec -T victoriametrics \
+            tar -hczf - -C "/victoria-metrics-data/snapshots/$snap" . > "$dest/vm-$stamp.tar.gz"; then
+        rm -f "$dest/vm-$stamp.tar.gz"
+        curl -fsS "$VM_LOCAL/snapshot/delete?snapshot=$snap" >/dev/null 2>&1 || true
+        die "VictoriaMetrics snapshot archive failed -- partial tarball removed"
+    fi
+    curl -fsS "$VM_LOCAL/snapshot/delete?snapshot=$snap" >/dev/null || say "WARN could not delete snapshot $snap on server"
+
+    say "backing up Grafana state (grafana stops briefly)..."
+    project=$(compose_project) || die "could not determine compose project name (run ./o11y check)"
+    [ -n "$project" ] || die "could not determine compose project name"
+    docker compose stop grafana >/dev/null
+    if ! docker run --rm -v "${project}_grafana-data:/data" -v "$dest:/backup" alpine \
+            tar -czf "/backup/grafana-$stamp.tar.gz" -C /data .; then
+        docker compose start grafana >/dev/null || true
+        rm -f "$dest/grafana-$stamp.tar.gz"
+        die "grafana backup failed -- grafana restarted, partial tarball removed"
+    fi
+    docker compose start grafana >/dev/null
+    chmod 600 "$dest/vm-$stamp.tar.gz" "$dest/grafana-$stamp.tar.gz"
+
+    say ""
+    say "backup complete:"
+    say "  $dest/vm-$stamp.tar.gz"
+    say "  $dest/grafana-$stamp.tar.gz"
+    say "NOTE: the Grafana tarball contains its database (sessions, hashed credentials) -- both files are mode 600, keep them that way."
+    say "NOTE: .env (secrets) is NOT included -- back it up separately and securely."
+    say "restore with: ./o11y restore $stamp${1:+ $1}"
+}
+
+cmd_restore() {
+    [ $# -ge 1 ] || die "usage: ./o11y restore <stamp> [backup-dir]"
+    need_docker; need_env
+    stamp="$1"
+    dir="${2:-$BACKUP_DIR_DEFAULT}"
+    [ -d "$dir" ] || die "backup dir not found: $dir"
+    dir=$(cd "$dir" && pwd)   # docker -v treats relative paths as volume names
+    vm_tar="$dir/vm-$stamp.tar.gz"
+    gr_tar="$dir/grafana-$stamp.tar.gz"
+    [ -f "$vm_tar" ] || die "$vm_tar not found"
+    [ -f "$gr_tar" ] || die "$gr_tar not found"
+    # plain grep, not -q: -q quits at first match and GNU tar's SIGPIPE
+    # would trip pipefail on large archives
+    tar -tzf "$vm_tar" | grep 'indexdb' >/dev/null \
+        || die "$vm_tar does not look like a VictoriaMetrics snapshot (no indexdb entries) -- refusing to wipe current data"
+    tar -tzf "$gr_tar" | grep 'grafana.db' >/dev/null \
+        || die "$gr_tar does not look like Grafana state (no grafana.db) -- refusing to wipe current data"
+
+    printf 'This OVERWRITES current VictoriaMetrics and Grafana data. Continue? [y/N] '
+    read -r reply
+    case "$reply" in y|Y|yes|YES) ;; *) say "aborted"; return 1 ;; esac
+
+    project=$(compose_project) || die "could not determine compose project name (run ./o11y check)"
+    [ -n "$project" ] || die "could not determine compose project name"
+
+    docker compose stop victoriametrics grafana panos-connector
+    say "restoring VictoriaMetrics data..."
+    docker run --rm -v "${project}_vm-data:/data" -v "$dir:/backup:ro" alpine \
+        sh -c "find /data -mindepth 1 -delete && tar -xzf /backup/vm-$stamp.tar.gz -C /data"
+    say "restoring Grafana data..."
+    docker run --rm -v "${project}_grafana-data:/data" -v "$dir:/backup:ro" alpine \
+        sh -c "find /data -mindepth 1 -delete && tar -xzf /backup/grafana-$stamp.tar.gz -C /data"
+    # up -d, not start: start fails when containers do not exist yet
+    # (fresh disaster-recovery host, or after ./o11y down)
+    docker compose up -d victoriametrics grafana panos-connector
+    say "restore complete. Verify with: ./o11y status"
+}
+
+# ---------- uninstall ----------
+
+cmd_uninstall() {
+    need_docker
+    purge=no
+    [ "${1:-}" = "--purge-data" ] && purge=yes
+
+    printf 'Stop and remove the stack containers? [y/N] '
+    read -r reply
+    case "$reply" in y|Y|yes|YES) ;; *) say "aborted"; return 1 ;; esac
+
+    if [ "$purge" = "yes" ]; then
+        printf 'ALSO DELETE all metric history and Grafana state (volumes). Type "purge" to confirm: '
+        read -r reply
+        [ "$reply" = "purge" ] || { say "aborted"; return 1; }
+        docker compose down -v
+        say "stack and data removed. .env left in place."
+    else
+        docker compose down
+        say "stack removed; data volumes kept. Use --purge-data to delete them."
+    fi
+}
+
+# ---------- help / dispatch ----------
+
+cmd_help() {
+    cat <<'EOF'
+Usage: ./o11y <command>
+
+Setup
+  init                  create .env interactively (secure prompts, mode 600)
+  check                 validate env, compose file, and inventory
+
+Lifecycle
+  up                    validate, build, and start the stack
+  down                  stop the stack (data volumes kept)
+  restart [service]     restart all or one service
+  update                git pull, rebuild/pull images, redeploy, verify health
+  uninstall [--purge-data]  remove containers (and optionally all data)
+
+Operations
+  status                container, health, data-freshness, and alert summary
+  logs [service]        follow logs
+  test-device <name>    dump raw PAN-OS XML for one device (--dump-raw)
+  poll-once             one poll cycle to stdout, no TSDB needed (--once)
+
+Data
+  backup [dir]          snapshot VictoriaMetrics + Grafana state to tarballs
+  restore <stamp> [dir] restore both from a previous backup
+
+First boot on a fresh server: scripts/install.sh, then ./o11y init && ./o11y up
+EOF
+}
+
+main() {
+    cmd="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        init)        cmd_init "$@" ;;
+        check)       cmd_check "$@" ;;
+        up)          cmd_up "$@" ;;
+        down)        cmd_down "$@" ;;
+        restart)     cmd_restart "$@" ;;
+        update)      cmd_update "$@" ;;
+        status)      cmd_status "$@" ;;
+        logs)        cmd_logs "$@" ;;
+        test-device) cmd_test_device "$@" ;;
+        poll-once)   cmd_poll_once "$@" ;;
+        backup)      cmd_backup "$@" ;;
+        restore)     cmd_restore "$@" ;;
+        uninstall)   cmd_uninstall "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *) die "unknown command '$cmd' -- see ./o11y help" ;;
+    esac
+}
+
+main "$@"

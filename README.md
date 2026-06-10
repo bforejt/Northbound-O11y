@@ -11,26 +11,42 @@ firewalls --HTTPS/XML API--> panos-connector --push--> VictoriaMetrics <-- Grafa
 
 ## Setup
 
-1. Clone the repo.
-2. Copy the env template and fill it in:
+On a fresh Debian/Ubuntu Docker host (or macOS with Docker Desktop):
 
-   ```sh
-   cp .env.example .env
-   ```
+```sh
+git clone https://github.com/bforejt/Northbound-O11y.git && cd Northbound-O11y
+scripts/install.sh        # installs Docker Engine + compose if missing
+                          # add --systemd for a boot-time systemd unit
+./o11y init               # creates .env with secure prompts (mode 600)
+# edit inventory/devices.yaml to list your firewalls
+./o11y up                 # validates everything, builds, starts the stack
+./o11y status             # containers, health, data freshness, alerts
+```
 
-   At minimum set `GRAFANA_ADMIN_PASSWORD` and `PANOS_API_KEY`
-   (see [Generating an API key](#generating-an-api-key)).
-3. Edit `inventory/devices.yaml` to list your firewalls.
-4. Start the stack:
+Open Grafana at <http://localhost:3000> (user `admin`, the password from
+`.env`). The **GlobalProtect Gateways** dashboard is in the **Network**
+folder. With the default 60 s poll interval you should see data within
+~2 minutes of startup.
 
-   ```sh
-   docker compose up -d
-   ```
+Prefer doing it by hand? The scripts are thin wrappers: `cp .env.example .env`,
+fill it in, then `docker compose up -d` does the same thing.
 
-5. Open Grafana at <http://localhost:3000> (user `admin`, the password from
-   `.env`). The **GlobalProtect Gateways** dashboard is in the **Network**
-   folder. With the default 60 s poll interval you should see data within
-   ~2 minutes of startup.
+## Management commands
+
+`./o11y help` lists everything. The daily set:
+
+| Command | Purpose |
+| --- | --- |
+| `./o11y status` | Health summary: containers, VM/Grafana health, last-push age, per-device up/down, firing alerts |
+| `./o11y check` | Validate `.env`, `compose.yaml`, and the inventory schema |
+| `./o11y logs [service]` | Follow logs |
+| `./o11y test-device <name>` / `./o11y poll-once` | First-run verification (see below) without remembering `--no-deps` |
+| `./o11y update` | `git pull`, rebuild, redeploy, wait for healthy |
+| `./o11y backup [dir]` / `./o11y restore <stamp>` | Consistent VictoriaMetrics snapshot + Grafana state; `.env` is **not** included |
+| `./o11y uninstall [--purge-data]` | Remove the stack; data only with the explicit flag |
+
+Scripts are bash 3.2 compatible (macOS default shell) and read secrets only
+from `.env` — never as arguments.
 
 ## Generating an API key
 
@@ -48,6 +64,10 @@ Use a dedicated account with the minimum role, not your admin login:
 4. Put the key in `.env` as `PANOS_API_KEY` (shared) or
    `PANOS_API_KEY__FW_EAST_01=...` (per device: name uppercased, `-` → `_`).
 
+Run the keygen curl from a trusted host: the admin password lands in the URL
+and your shell history (prefix the command with a space if `HISTCONTROL`
+includes `ignorespace`), and drop `-k` if the firewall has a trusted cert.
+
 Key lifetime follows the device's *API key lifetime* setting
 (Device → Setup → Management → Authentication Settings). **An HTTP 403 in the
 connector logs means the key is invalid or expired — regenerate it.**
@@ -63,7 +83,8 @@ against a real firewall before trusting the numbers.
 **1. Dump the raw XML for one device:**
 
 ```sh
-docker compose run --rm --no-deps panos-connector --dump-raw fw-east-01
+./o11y test-device fw-east-01
+# equivalent: docker compose run --rm --no-deps panos-connector --dump-raw fw-east-01
 ```
 
 Check that each `<entry>` carries a gateway-name field and a username field.
@@ -80,7 +101,8 @@ the candidate lists at the top of `connector/modules/gp_gateway.py`.
 **2. Run one poll cycle without a TSDB:**
 
 ```sh
-docker compose run --rm --no-deps panos-connector --once
+./o11y poll-once
+# equivalent: docker compose run --rm --no-deps panos-connector --once
 ```
 
 This prints the metrics in Prometheus text format to stdout and does not POST
@@ -109,7 +131,7 @@ If parsing fails, set `LOG_LEVEL=DEBUG` in `.env` to log the raw structures.
 
 2. Optionally add a per-device key in `.env`: `PANOS_API_KEY__FW_SOUTH_01=...`
    (falls back to `PANOS_API_KEY`).
-3. `docker compose restart panos-connector`.
+3. `./o11y restart panos-connector`.
 
 A device that stops answering only affects itself: its `panos_connector_up`
 goes to 0 (and the provisioned alert fires after 5 minutes); all other devices
