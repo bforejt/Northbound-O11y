@@ -11,7 +11,7 @@ firewalls --HTTPS/XML API--> panos-connector --push--> VictoriaMetrics <-- Grafa
 
 ## Setup
 
-1. Clone the repo and `cd observability/`.
+1. Clone the repo.
 2. Copy the env template and fill it in:
 
    ```sh
@@ -142,6 +142,10 @@ inventory entry. Append the function to the `MODULES` list in
 
 ## Future stages (not built here)
 
-Streaming lane (gnmic/gNMI for IOS-XE, NX-OS, PAN-OS OpenConfig), NetBox as
+Streaming lane (gnmic/gNMI for IOS-XE, NX-OS, PAN-OS OpenConfig), Nautobot as
 source of truth rendering `inventory/devices.yaml`, VictoriaLogs for syslog.
-The inventory file shape is the NetBox contract — don't extend it casually.
+The inventory file shape is the Nautobot contract — don't extend it casually.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

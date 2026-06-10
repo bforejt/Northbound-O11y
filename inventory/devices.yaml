@@ -1,4 +1,4 @@
-# Connector inventory. This file's shape is the contract that NetBox will
+# Connector inventory. This file's shape is the contract that Nautobot will
 # render in a later stage -- do not extend it without need.
 devices:
   - name: fw-east-01
