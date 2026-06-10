@@ -1,0 +1,61 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: connector-health
+    folder: Network
+    interval: 1m
+    rules:
+      - uid: panos-connector-down
+        title: PAN-OS connector device unreachable
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: panos_connector_up
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              datasource:
+                type: __expr__
+                uid: __expr__
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: C
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Connector cannot poll {{ $labels.device }}
+            (panos_connector_up == 0 for 5 minutes). Check connector logs;
+            an HTTP 403 means the API key needs regenerating.

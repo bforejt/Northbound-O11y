@@ -1,0 +1,11 @@
+# Connector inventory. This file's shape is the contract that NetBox will
+# render in a later stage -- do not extend it without need.
+devices:
+  - name: fw-east-01
+    host: 10.0.10.1
+    site: east
+    role: gp-gateway
+  - name: fw-west-01
+    host: 10.0.20.1
+    site: west
+    role: gp-gateway

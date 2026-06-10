@@ -1,0 +1,52 @@
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.145.0
+    command:
+      - -retentionPeriod=13   # months
+      - -httpListenAddr=:8428
+    ports:
+      - "127.0.0.1:8428:8428"
+    volumes:
+      - vm-data:/victoria-metrics-data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.4.4
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+
+  panos-connector:
+    build: ./connector
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./inventory/devices.yaml:/config/devices.yaml:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+
+volumes:
+  vm-data:
+  grafana-data:
